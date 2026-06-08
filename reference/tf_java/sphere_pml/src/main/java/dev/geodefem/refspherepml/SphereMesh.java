@@ -1,4 +1,4 @@
-package dev.geodefem.refspherepec;
+package dev.geodefem.refspherepml;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -10,33 +10,34 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Minimal Gmsh MSH 4.x parser for the sphere PEC fixture.
+ * Minimal Gmsh MSH 4.x parser + edge / centroid / complex-epsilon helpers
+ * for the sphere-PML fixture.
  *
- * <p>Reads the bundled {@code reference/fixtures/sphere_pec/sphere.msh}
- * file (MSH format 4.1, ASCII) and extracts:
+ * <p>Mirror of {@code reference/tf_java/sphere_pec/.../SphereMesh.java}
+ * extended with:
  * <ul>
- *   <li>Node coordinates: shape {@code [nNodes][3]}, 0-based indexing.</li>
- *   <li>Tet connectivity: shape {@code [nTets][4]}, 0-based, from all
- *       {@code Tetrahedron} blocks.</li>
- *   <li>Per-tet physical group tags: shape {@code [nTets]}, from the
- *       {@code $PhysicalNames} and {@code $Elements} / {@code $Entities}
- *       metadata.</li>
+ *   <li>{@link #tetCentroidRadii(double[][], int[][])} — per-tet centroid
+ *       distance from the origin, the geometric input to the PML profile.
+ *       Mirror of {@code geode_core::tet_centroid_radii} and
+ *       {@code reference/numpy/sphere_pml.py::tet_centroid_radii}.</li>
+ *   <li>{@link #buildComplexEpsilonRPml(int[], double[], double, double)} —
+ *       per-tet complex relative permittivity realizing the
+ *       scalar-isotropic PML. Mirror of
+ *       {@code geode_core::build_complex_epsilon_r_pml} /
+ *       {@code reference/numpy/sphere_pml.py::build_complex_epsilon_r_pml}.</li>
  * </ul>
  *
- * <p>This is a correctness-anchoring reference, not a production mesh
- * library. The parser covers the exact dialect produced by Gmsh 4.x for
- * the bundled sphere fixture; unknown section types are skipped.
+ * <p>Mesh I/O, edge enumeration, and PEC mask are unchanged from the
+ * sphere-PEC sibling — the PML problem differs only in the per-tet
+ * constitutive scaling on the mass. The bundled
+ * {@code reference/fixtures/sphere_pml/sphere.msh} is the same file as
+ * {@code reference/fixtures/sphere_pec/sphere.msh} (774 nodes, 3335 tets).
  *
- * <p>Physical-group tag assignment mirrors
- * {@code reference/numpy/sphere_pec.py::read_sphere_fixture}: the
- * {@code gmsh:physical} tag for each element block is the tag of the
- * entity that block belongs to, per the MSH4 element block header
- * {@code (entity_dim entity_tag element_type n_elements)}.
- *
- * <p>Decision: mesh construction does NOT go through TF-Java. The
- * symbolic-graph assembly path consumes the resulting {@code nodes} and
- * {@code tets} arrays as inputs to the Nédélec local matrix kernel. This
- * matches the JAX/Julia/NumPy pattern.
+ * <p>Decision: mesh construction and the complex-epsilon profile do NOT
+ * go through TF-Java. The symbolic-graph assembly path consumes the
+ * resulting {@code nodes}, {@code tets}, and per-tet
+ * {@code epsilonR_re / epsilonR_im} arrays as inputs. This matches the
+ * JAX/Julia/NumPy pattern.
  */
 public final class SphereMesh {
 
@@ -47,7 +48,9 @@ public final class SphereMesh {
     public static final int PHYS_VACUUM_GAP      = 2; // tets in R_SPHERE < r <= R_PML_INNER
     public static final int PHYS_PML_SHELL       = 5; // tets in R_PML_INNER < r <= R_BUFFER
 
-    public static final double R_BUFFER = 2.0; // outer PEC wall radius
+    public static final double R_SPHERE     = 1.0; // inner dielectric radius
+    public static final double R_PML_INNER  = 1.5; // PML absorption start
+    public static final double R_BUFFER     = 2.0; // outer PEC wall radius
 
     /** Mesh output tuple. */
     public static final class Mesh {
@@ -79,13 +82,12 @@ public final class SphereMesh {
     }
 
     // ------------------------------------------------------------------
-    // Parser internals
+    // Parser internals (identical to the sphere_pec sibling)
     // ------------------------------------------------------------------
 
     private static Mesh parse(BufferedReader br) throws IOException {
-        // We read section by section in a top-level loop.
         double[][] nodes   = null;
-        long[] nodeGmshIds = null; // Gmsh 1-based node IDs -> 0-based index map
+        long[] nodeGmshIds = null;
         Map<Integer, Integer> volEntityToPhysical = new HashMap<>();
         List<int[]> tetList    = new ArrayList<>();
         List<Integer> tagList  = new ArrayList<>();
@@ -119,7 +121,6 @@ public final class SphereMesh {
                     parseElements(br, nodeGmshIds, volEntityToPhysical, tetList, tagList);
                     break;
                 default:
-                    // Skip unknown or unneeded sections.
                     if (line.startsWith("$") && !line.startsWith("$End")) {
                         String endTag = "$End" + line.substring(1);
                         skipUntilEnd(br, endTag);
@@ -134,29 +135,12 @@ public final class SphereMesh {
         int[][] tets = tetList.toArray(new int[0][]);
         int[] tetTags = tagList.stream().mapToInt(Integer::intValue).toArray();
 
-        System.out.printf("[sphere-pec] Parsed mesh: %d nodes, %d tets%n",
+        System.out.printf("[sphere-pml] Parsed mesh: %d nodes, %d tets%n",
                 nodes.length, tets.length);
         return new Mesh(nodes, tets, tetTags);
     }
 
-    /**
-     * Parse the {@code $Nodes} section.
-     *
-     * <p>MSH4 format:
-     * <pre>
-     * $Nodes
-     * numEntityBlocks numNodes minNodeTag maxNodeTag
-     * entityDim entityTag parametric numNodesInBlock
-     * nodeTag...     (one per line, numNodesInBlock lines)
-     * x y z...       (one per line, numNodesInBlock lines)
-     * ...
-     * $EndNodes
-     * </pre>
-     *
-     * @return {@code [nodes (double[][]), nodeGmshIds (long[])]}
-     */
     private static Object[] parseNodes(BufferedReader br) throws IOException {
-        // Header: numEntityBlocks totalNodes minTag maxTag
         String header = br.readLine();
         if (header == null) throw new IOException("Unexpected EOF in $Nodes header");
         String[] hp = header.trim().split("\\s+");
@@ -164,31 +148,24 @@ public final class SphereMesh {
         int totalNodes      = Integer.parseInt(hp[1]);
 
         double[][] nodes    = new double[totalNodes][3];
-        long[] gmshIds      = new long[totalNodes]; // index i -> Gmsh node tag
-        // We also need a reverse map: Gmsh node tag -> 0-based index.
-        // Build it as we go, using a simple array (tags may be sparse in general,
-        // but for the sphere fixture they are compact 1..nNodes).
+        long[] gmshIds      = new long[totalNodes];
         long maxTag = Long.parseLong(hp[3]);
-        // Allocate reverse map for tag -> 0-based index.
-        long[] tagToIdx = new long[(int)(maxTag + 1)]; // index by tag
+        long[] tagToIdx = new long[(int)(maxTag + 1)];
         Arrays.fill(tagToIdx, -1);
 
-        int ptr = 0; // next free slot in nodes[]
+        int ptr = 0;
         for (int b = 0; b < numEntityBlocks; b++) {
             String bh = br.readLine();
             if (bh == null) throw new IOException("Unexpected EOF in $Nodes block header");
             String[] bhp = bh.trim().split("\\s+");
-            // entityDim entityTag parametric numNodesInBlock
             int nInBlock = Integer.parseInt(bhp[3]);
 
-            // Read node tags first.
             long[] blockTags = new long[nInBlock];
             for (int i = 0; i < nInBlock; i++) {
                 String tagLine = br.readLine();
                 if (tagLine == null) throw new IOException("Unexpected EOF reading node tags");
                 blockTags[i] = Long.parseLong(tagLine.trim());
             }
-            // Read coordinates.
             for (int i = 0; i < nInBlock; i++) {
                 String coordLine = br.readLine();
                 if (coordLine == null) throw new IOException("Unexpected EOF reading node coords");
@@ -208,33 +185,9 @@ public final class SphereMesh {
             throw new IOException("Expected $EndNodes, got: " + endLine);
         }
 
-        // Return both the node array and the reverse-lookup array.
         return new Object[] { nodes, tagToIdx };
     }
 
-    /**
-     * Parse the {@code $Elements} section and collect tetrahedra.
-     *
-     * <p>MSH4 format:
-     * <pre>
-     * $Elements
-     * numEntityBlocks numElements minElemTag maxElemTag
-     * entityDim entityTag elementType numElementsInBlock
-     * elemTag nodeTag...    (one per line)
-     * ...
-     * $EndElements
-     * </pre>
-     *
-     * <p>Element type 4 = 4-node tetrahedron (Tet4). For each tet block the
-     * geometric entity tag is resolved to the physical-group tag via the
-     * {@code $Entities} map ({@link #parseEntities}); this matches the
-     * per-tet {@code gmsh:physical} cell-data that
-     * {@code reference/numpy/sphere_pec.py::read_sphere_fixture} consumes.
-     *
-     * <p>If a tet block's entity is absent from the map (no $Entities
-     * section, or no physical-group assignment), the block is collected
-     * with the raw entity tag as a fallback.
-     */
     private static void parseElements(BufferedReader br, long[] tagToIdx,
             Map<Integer, Integer> volEntityToPhysical,
             List<int[]> tetList, List<Integer> tagList) throws IOException {
@@ -247,20 +200,19 @@ public final class SphereMesh {
             String bh = br.readLine();
             if (bh == null) throw new IOException("Unexpected EOF in $Elements block header");
             String[] bhp = bh.trim().split("\\s+");
-            // entityDim entityTag elementType numElementsInBlock
             int entityDim  = Integer.parseInt(bhp[0]);
             int entityTag  = Integer.parseInt(bhp[1]);
             int elemType   = Integer.parseInt(bhp[2]);
             int nInBlock   = Integer.parseInt(bhp[3]);
 
-            boolean isTet4 = (elemType == 4); // Gmsh element type 4 = 4-node tet
+            boolean isTet4 = (elemType == 4);
 
-            // Resolve the physical-group tag from $Entities. The MSH4 block
-            // header carries the geometric entity tag, not the physical
-            // tag; meshio's `gmsh:physical` (what the NumPy/Burn sides
-            // consume) is the physical-group tag. Fallback to entityTag
-            // preserves the single-physical-group shortcut for fixtures
-            // where the two coincide.
+            // Resolve the per-tet physical-group tag via the $Entities map.
+            // MSH4 element blocks carry the geometric entity tag, not the
+            // physical group tag — meshio's `gmsh:physical` is what the
+            // NumPy/Burn sides consume, so we mirror that semantics here.
+            // Fallback to entityTag preserves the legacy single-physical-
+            // group shortcut for meshes without an $Entities section.
             int physicalTag = entityTag;
             if (isTet4 && entityDim == 3) {
                 Integer mapped = volEntityToPhysical.get(entityTag);
@@ -270,9 +222,8 @@ public final class SphereMesh {
             for (int i = 0; i < nInBlock; i++) {
                 String eLine = br.readLine();
                 if (eLine == null) throw new IOException("Unexpected EOF reading element");
-                if (!isTet4) continue; // skip non-tet blocks
+                if (!isTet4) continue;
                 String[] ep = eLine.trim().split("\\s+");
-                // ep[0] = elem tag, ep[1..4] = node tags (Gmsh 1-based)
                 int[] tet = new int[4];
                 for (int v = 0; v < 4; v++) {
                     long nodeTag = Long.parseLong(ep[v + 1]);
@@ -350,7 +301,7 @@ public final class SphereMesh {
     }
 
     // ------------------------------------------------------------------
-    // Edge enumeration + PEC mask — JVM side (mirrors numpy/sphere_pec.py)
+    // Edge enumeration + PEC mask (mirror of sphere_pec sibling)
     // ------------------------------------------------------------------
 
     /** Six local-edge vertex pairs, matching TET_LOCAL_EDGES in the NumPy reference. */
@@ -358,7 +309,6 @@ public final class SphereMesh {
         {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}
     };
 
-    /** Result of edge enumeration. */
     public static final class EdgeTable {
         /** Global edges, shape [nEdges][2], lo < hi (0-based node indices). */
         public final int[][] edges;
@@ -376,23 +326,12 @@ public final class SphereMesh {
 
     /**
      * Build globally-oriented edge table + per-tet (index, sign) tables.
-     *
-     * <p>Mirror of {@code reference/numpy/sphere_pec.py::build_edges}.
-     * Edges are deduplicated and sorted lexicographically (lower-node-tag
-     * first), matching the NumPy reference's {@code np.unique} approach.
-     *
-     * @param tets shape [nTets][4]
-     * @return {@link EdgeTable}
+     * Mirror of {@code reference/numpy/sphere_pec.py::build_edges}.
      */
     public static EdgeTable buildEdges(int[][] tets) {
         int nTets = tets.length;
 
-        // 1. Collect all (lo, hi) pairs — one per local edge per tet.
-        //    Use a sorted set of (lo*offset + hi) longs for dedup.
-        //    Maximum node count for this fixture is ~800, so a 32-bit key
-        //    with offset = 2^20 works fine. Use a Map<Long, Integer> to
-        //    get a stable insertion order for the unique edges.
-        Map<Long, Integer> edgeMap = new java.util.TreeMap<>(); // sorted by key = lexicographic
+        Map<Long, Integer> edgeMap = new java.util.TreeMap<>();
         for (int e = 0; e < nTets; e++) {
             for (int[] localEdge : TET_LOCAL_EDGES) {
                 int a = tets[e][localEdge[0]];
@@ -404,7 +343,6 @@ public final class SphereMesh {
             }
         }
 
-        // 2. Build the edge array from the map (TreeMap is sorted → lexicographic).
         int nEdges = edgeMap.size();
         int[][] edges = new int[nEdges][2];
         for (Map.Entry<Long, Integer> entry : edgeMap.entrySet()) {
@@ -414,7 +352,6 @@ public final class SphereMesh {
             edges[idx][1] = (int) (key & 0xFFFFF);
         }
 
-        // 3. Build per-tet (index, sign) arrays.
         int[][] tetEdgeIdx  = new int[nTets][6];
         int[][] tetEdgeSign = new int[nTets][6];
         for (int e = 0; e < nTets; e++) {
@@ -433,38 +370,118 @@ public final class SphereMesh {
         return new EdgeTable(edges, tetEdgeIdx, tetEdgeSign);
     }
 
+    // ------------------------------------------------------------------
+    // PML-specific: per-tet centroid radii + complex epsilon profile
+    // ------------------------------------------------------------------
+
     /**
-     * Per-tet relative permittivity assignment.
+     * Per-tet centroid distance from the origin.
      *
-     * <p>Mirror of {@code reference/numpy/sphere_pec.py::build_epsilon_r}.
-     * Tets tagged {@code PHYS_SPHERE_INTERIOR} get {@code n_inside²};
-     * all others get {@code 1.0}.
+     * <p>Mirror of {@code geode_core::tet_centroid_radii} and
+     * {@code reference/numpy/sphere_pml.py::tet_centroid_radii}. Used by
+     * {@link #buildComplexEpsilonRPml(int[], double[], double, double)}
+     * to decide which tets sit in the absorbing shell and how strongly
+     * to absorb in each.
      *
-     * @param tetTags per-tet physical group tags
-     * @param nInside refractive index inside the sphere
-     * @return per-tet epsilon_r
+     * @param nodes shape [nNodes][3]
+     * @param tets  shape [nTets][4]
+     * @return per-tet centroid radius, length nTets
      */
-    public static double[] buildEpsilonR(int[] tetTags, double nInside) {
-        double epsInside = nInside * nInside;
-        double[] eps = new double[tetTags.length];
-        for (int i = 0; i < tetTags.length; i++) {
-            eps[i] = (tetTags[i] == PHYS_SPHERE_INTERIOR) ? epsInside : 1.0;
+    public static double[] tetCentroidRadii(double[][] nodes, int[][] tets) {
+        int nTets = tets.length;
+        double[] r = new double[nTets];
+        for (int e = 0; e < nTets; e++) {
+            double cx = 0.0, cy = 0.0, cz = 0.0;
+            for (int v = 0; v < 4; v++) {
+                int n = tets[e][v];
+                cx += nodes[n][0];
+                cy += nodes[n][1];
+                cz += nodes[n][2];
+            }
+            cx *= 0.25;
+            cy *= 0.25;
+            cz *= 0.25;
+            r[e] = Math.sqrt(cx * cx + cy * cy + cz * cz);
         }
-        return eps;
+        return r;
     }
 
     /**
-     * Boolean interior-edge mask (PEC boundary elimination).
+     * Per-tet complex relative permittivity realizing the scalar-isotropic PML.
      *
-     * <p>Mirror of
-     * {@code reference/numpy/sphere_pec.py::sphere_pec_interior_edges}:
-     * an edge is interior iff at least one endpoint is NOT on the outer
-     * PEC sphere ({@code |r| ≈ R_BUFFER}).
+     * <p>Mirror of {@code geode_core::build_complex_epsilon_r_pml} and
+     * {@code reference/numpy/sphere_pml.py::build_complex_epsilon_r_pml}.
      *
-     * @param nodes shape [nNodes][3]
-     * @param edges shape [nEdges][2]
-     * @return boolean mask, length nEdges
+     * <p>Profile:
+     * <ul>
+     *   <li>Tet in {@code sphere_interior} ({@code PHYS_SPHERE_INTERIOR}):
+     *       {@code ε = n_inside² + 0j} (real dielectric).</li>
+     *   <li>Tet in {@code vacuum_gap} (any tag except {@code PHYS_PML_SHELL}
+     *       and not the dielectric): {@code ε = 1 + 0j} (real vacuum).</li>
+     *   <li>Tet in {@code pml_shell} ({@code PHYS_PML_SHELL}): quadratic
+     *       absorption ramp anchored at {@code R_PML_INNER},
+     *       <pre>
+     *         ε(r) = 1 − j σ₀ ((r − R_PML_INNER) / (R_BUFFER − R_PML_INNER))²
+     *       </pre>
+     *       with the ramp coordinate {@code u} clamped to {@code [0, 1]}.</li>
+     * </ul>
+     *
+     * <p>Sign convention: {@code exp(+jωt)} → outgoing-wave attenuation
+     * requires {@code Im(ε) < 0}. The downstream eigensolver canonicalizes
+     * the eigenvalue sign to {@code Im(λ) > 0} per PR #155 Judge's
+     * binding decision.
+     *
+     * <p>Returned arrays are real and imaginary parts laid out as parallel
+     * {@code double[nTets]} arrays. TF-Java 1.0.0 has no native c128 typed
+     * value, so we keep the two parts separate everywhere on the JVM side
+     * and let the Python driver fuse them into a {@code complex128} CSR
+     * for the eigensolve.
+     *
+     * @param tetTags  per-tet physical group tags
+     * @param radii    per-tet centroid radii (output of {@link #tetCentroidRadii})
+     * @param nInside  refractive index inside the dielectric sphere
+     * @param sigma0   PML absorption strength at {@code r = R_BUFFER};
+     *                 0 collapses the profile to the real PEC ε
+     * @return [re, im] arrays each of length nTets
      */
+    public static double[][] buildComplexEpsilonRPml(
+            int[] tetTags, double[] radii, double nInside, double sigma0) {
+        if (tetTags.length != radii.length) {
+            throw new IllegalArgumentException(
+                    "tetTags and radii length mismatch: "
+                    + tetTags.length + " vs " + radii.length);
+        }
+        int n = tetTags.length;
+        double epsInside = nInside * nInside;
+        double width = R_BUFFER - R_PML_INNER;
+
+        double[] re = new double[n];
+        double[] im = new double[n];
+
+        for (int i = 0; i < n; i++) {
+            int tag = tetTags[i];
+            if (tag == PHYS_SPHERE_INTERIOR) {
+                re[i] = epsInside;
+                im[i] = 0.0;
+            } else if (tag == PHYS_PML_SHELL) {
+                double u = (radii[i] - R_PML_INNER) / width;
+                if (u < 0.0) u = 0.0;
+                if (u > 1.0) u = 1.0;
+                re[i] = 1.0;
+                im[i] = -sigma0 * u * u;
+            } else {
+                re[i] = 1.0;
+                im[i] = 0.0;
+            }
+        }
+        return new double[][] { re, im };
+    }
+
+    // ------------------------------------------------------------------
+    // PEC mask + linear algebra utilities (mirror of sphere_pec sibling)
+    // ------------------------------------------------------------------
+
+    /** Boolean interior-edge mask (PEC boundary elimination). */
     public static boolean[] interiorEdgeMask(double[][] nodes, int[][] edges) {
         double tol = 1e-6 * Math.max(R_BUFFER, 1.0);
         boolean[] onBoundary = new boolean[nodes.length];
@@ -478,7 +495,6 @@ public final class SphereMesh {
 
         boolean[] mask = new boolean[edges.length];
         for (int e = 0; e < edges.length; e++) {
-            // Interior = at least one endpoint is NOT on the outer wall.
             mask[e] = !(onBoundary[edges[e][0]] && onBoundary[edges[e][1]]);
         }
         return mask;
